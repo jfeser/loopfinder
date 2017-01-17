@@ -10,6 +10,7 @@ Options:
   --time-distance TIME_DIST  Testing testing [default: 1].
 '''
 
+import random
 from moviepy.video.fx.resize import resize
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from moviepy.config import get_setting
@@ -26,6 +27,8 @@ import time
 import os
 import subprocess as sp
 from ffmpeg_writer import ffmpeg_write_video
+
+RANDOM_SEED = 0
 
 class LSH(object):
     def __init__(self, b):
@@ -54,60 +57,9 @@ class Distance(object):
         return np.sqrt(u + v - 2 * f1.dot(f2))
         
     
-def select_scenes(clip, matches, min_time_span, time_distance=0):
-    """
-    match_thr
-      The smaller, the better-looping the gifs are.
-    min_time_span
-      Only GIFs with a duration longer than min_time_span (in seconds)
-      will be extracted.
-    nomatch_thr
-      If None, then it is chosen equal to match_thr
-    """
-
-    starts = {}
-    for match in matches:
-        (start, end) = match
-        if start not in starts:
-            starts[start] = match
-        else:
-            starts[start] = match if end > starts[start][1] else starts[start]
-    
-    out = []
-    last_start = None
-    for start in sorted(starts.keys()):
-        if (last_start is None or start > last_start + time_distance) and starts[start][1] - start > min_time_span:
-            last_start = start
-            out.append(starts[start])
-       
-    return out
-
-    
-def from_clip(worker_num, clip, max_d, min_d, num_hashes, match_progress):
-    """Finds all the frames tht look alike in a clip, for instance to
-    make a looping gif.
-    
-    This returns a FramesMatches object of the all pairs of frames
-    with (min_d <= t2 - t1 <= max_d).
-
-    This is a well optimized routine and quite fast.
-
-    Parameters
-    -----------
-    clip
-      A MoviePy video clip, possibly transformed/resized.
-
-    max_d
-      Maximum duration (in seconds) between two matching frames.
-
-    max_d
-      Minimum duration (in seconds) between two matching frames.
-
-    num_hashes
-      Number of hashes to use for locality-sensitive hashing. More
-      hashes = closer matches.
-
-    """ 
+def find_matches(input_file, start_time, end_time, max_d, min_d, num_hashes, progress, out_channel):
+    clipFull = VideoFileClip(input_file).subclip(start_time, end_time)
+    clip = clipFull.fx(resize, width=32)
 
     lsh = LSH(num_hashes)
 
@@ -117,7 +69,7 @@ def from_clip(worker_num, clip, max_d, min_d, num_hashes, match_progress):
     in_range = []
     too_close = []
     for (t, frame) in clip.iter_frames(with_times=True, progress_bar=False):
-        match_progress[worker_num] = (t / clip.duration) * 100
+        progress.value = (t / float(clip.duration)) * 100
 
         feature = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY).flatten()
         
@@ -140,20 +92,36 @@ def from_clip(worker_num, clip, max_d, min_d, num_hashes, match_progress):
         matches = [(t2, t) for t2 in hashes.get(key, [])]
         matching_frames += matches
         too_close.append((t, key))
-                
-    return matching_frames
 
+    matching_frames = [(t1 + start_time, t2 + start_time) for (t1, t2) in matching_frames]
+    out_channel.send(matching_frames)
+
+
+def select_scenes(input_file, matches, min_time_span, time_distance, progress, out_channel):
+    starts = {}
+    for match in matches:
+        (start, end) = match
+        if start not in starts:
+            starts[start] = match
+        else:
+            starts[start] = match if end > starts[start][1] else starts[start]
     
-def process_clip(worker_num, input_file, start_time, end_time,
-                 max_d, min_d, num_hashes, time_distance, out_dir,
-                 match_progress, match_done, write_progress):
-    clipFull = VideoFileClip(input_file).subclip(start_time, end_time)
+    out = []
+    last_start = None
+    sorted_starts = list(sorted(starts.keys()))
+    i = 0
+    for start in sorted_starts:
+        progress.value = (i / float(len(sorted_starts))) * 100
+        if (last_start is None or start > last_start + time_distance) and starts[start][1] - start > min_time_span:
+            last_start = start
+            out.append(starts[start])
+        i += 1
 
-    clip = clipFull.fx(resize, width=32)
-    matches = from_clip(worker_num, clip, max_d, min_d,
-                        num_hashes, match_progress)
-    matches = select_scenes(clip, matches, min_d, time_distance)
-    match_done[worker_num] = 1
+    out_channel.send(out)
+
+
+def write_gifs(input_file, matches, out_dir, progress):
+    clip = VideoFileClip(input_file)
 
     try:
         os.makedirs(out_dir)
@@ -161,12 +129,20 @@ def process_clip(worker_num, input_file, start_time, end_time,
         pass
     
     for (i, (start, end)) in enumerate(matches):
-        write_progress[worker_num] = (i / float(len(matches))) * 100
-        name = "%s/%08d_%08d.mp4" % (out_dir, 100*start + start_time, 100*end + start_time)
-        ffmpeg_write_video(clipFull.subclip(start, end), name, clip.fps, verbose=False, threads=2)
+        progress.value = (i / float(len(matches))) * 100
+        name = "%s/%08d_%08d.mp4" % (out_dir, 100 * start, 100 * end)
+        ffmpeg_write_video(clip.subclip(start, end), name, clip.fps, verbose=False, threads=1)
+
+
+def divide(l, k):
+    for i in range(k):
+        yield l[i::k]
 
         
 def main():
+    random.seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+    
     args = docopt(__doc__)
     input_file = args['FILE']
     out_dir = args['OUT_DIR']
@@ -175,44 +151,44 @@ def main():
     time_distance = float(args['--time-distance'])
     num_hashes = int(args['--num-hashes'])
     
-    nproc = 4
-    match_progress = mp.Array('d', [0] * nproc)
-    match_done = mp.Array('d', [0] * nproc)
-    write_progress = mp.Array('d', [0] * nproc)
-
-    clip = VideoFileClip(input_file)
-    start_times = []
-    end_times = []
-    parent_pipes = []
-    child_pipes = []
+    nproc = mp.cpu_count()    
+    duration = VideoFileClip(input_file).duration
+    
+    print 'Finding loops...'
+    match_procs = []
     for i in range(nproc):
-        start_times.append((clip.duration / float(nproc)) * i)
-        end_times.append((clip.duration / float(nproc)) * (i + 1) + max_d)
-
         (recv, send) = mp.Pipe()
-        parent_pipes.append(recv)
-        child_pipes.append(send)
-        
-    procs = []
-    for i in range(nproc):
-        p = mp.Process(target=process_clip,
-                       args=(i, input_file, start_times[i], end_times[i],
-                             max_d, min_d, num_hashes, time_distance, out_dir,
-                             match_progress, match_done, write_progress))
+        progress = mp.Value('f')
+        start_time = (duration / float(nproc)) * i
+        end_time = min(duration, (duration / float(nproc)) * (i + 1) + max_d)
+        p = mp.Process(target=find_matches,
+                       args=(input_file, start_time, end_time, max_d, min_d,
+                             num_hashes, progress, send))
         p.start()
-        procs.append(p)
+        match_procs.append((p, recv, progress))
 
-    print 'Finding matches...'
+    matches = []
     with tqdm(total=100) as progress:
         prev_prog = 0
         while True:
-            prog = int(sum(match_progress) / float(len(match_progress)))
+            prog = int(sum(p.value for (_, _, p) in match_procs) / float(nproc))
             if prog > prev_prog:
                 progress.update(prog - prev_prog)
                 prev_prog = prog
+
             all_done = True
-            for i in range(nproc):
-                all_done = all_done and match_done[i] == 1
+            procs = []
+            for (proc, ch, prog) in match_procs:
+                if not ch:
+                    procs.append((proc, None, prog))
+                elif ch.poll():
+                    matches += ch.recv()
+                    procs.append((proc, None, prog))
+                else:
+                    all_done = False
+                    procs.append((proc, ch, prog))
+            match_procs = procs
+                    
             if all_done:
                 break
             else:
@@ -220,19 +196,72 @@ def main():
         if prev_prog < 100:
             progress.update(100 - prev_prog)
 
-    print 'Writing gifs...'
+    print 'Found %d loops.' % len(matches)
+                        
+
+    print 'Selecting the best loops...'
+    filter_procs = []
+    for i, ms in enumerate(divide(matches, nproc)):
+        (recv, send) = mp.Pipe()
+        progress = mp.Value('f')
+        p = mp.Process(target=select_scenes,
+                       args=(input_file, ms, min_d, time_distance, progress, send))
+        p.start()
+        filter_procs.append((p, recv, progress))
+
+    matches = []
     with tqdm(total=100) as progress:
         prev_prog = 0
         while True:
-            prog = int(sum(write_progress) / float(len(write_progress)))
+            prog = int(sum(p.value for (_, _, p) in filter_procs) / float(nproc))
             if prog > prev_prog:
                 progress.update(prog - prev_prog)
                 prev_prog = prog
+
             all_done = True
-            for i in range(nproc):
-                all_done = all_done and not procs[i].is_alive()
+            procs = []
+            for (proc, ch, prog) in filter_procs:
+                if not ch:
+                    procs.append((proc, None, prog))
+                elif ch.poll():
+                    matches += ch.recv()
+                    procs.append((proc, None, prog))
+                else:
+                    all_done = False
+                    procs.append((proc, ch, prog))
+            filter_procs = procs
+                    
             if all_done:
                 break
+            else:
+                time.sleep(0.1)
+        if prev_prog < 100:
+            progress.update(100 - prev_prog)
+    matches = list(set(matches))
+
+    print 'Selected the best %d loops.' % len(matches)
+            
+
+    print 'Writing gifs...'
+    write_procs = []
+    for i, ms in enumerate(divide(matches, nproc)):
+        progress = mp.Value('f')
+        p = mp.Process(target=write_gifs, args=(input_file, ms, out_dir, progress))
+        p.start()
+        write_procs.append((p, progress))
+
+    with tqdm(total=100) as progress:
+        prev_prog = 0
+        while True:
+            prog = int(sum(p.value for (_, p) in write_procs) / float(nproc))
+            if prog > prev_prog:
+                progress.update(prog - prev_prog)
+                prev_prog = prog
+            all_done = all(not proc.is_alive() for (proc, _) in write_procs)
+            if all_done:
+                break
+            else:
+                time.sleep(0.1)
         if prev_prog < 100:
             progress.update(100 - prev_prog)
 
