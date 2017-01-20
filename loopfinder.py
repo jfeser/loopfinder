@@ -16,8 +16,8 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 from moviepy.config import get_setting
 from moviepy.tools import verbose_print, subprocess_call
 import multiprocessing as mp
-import cv2
 from collections import defaultdict
+from skimage.color import rgb2gray
 import numpy as np
 from numpy.random import multivariate_normal
 import sys
@@ -71,7 +71,7 @@ def find_matches(input_file, start_time, end_time, max_d, min_d, num_hashes, pro
     for (t, frame) in clip.iter_frames(with_times=True, progress_bar=False):
         progress.value = (t / float(clip.duration)) * 100
 
-        feature = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY).flatten()
+        feature = rgb2gray(frame).flatten()
         
         for (i, (t2, key)) in enumerate(in_range):
             if t - t2 > max_d:
